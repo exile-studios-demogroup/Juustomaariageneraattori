@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Juustomaariageneraattori</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #fff;
+    overflow: hidden;
+    font-family: 'Arial Black', 'Arial', sans-serif;
+  }
+  #startScreen {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    background: #fff; z-index: 90; cursor: pointer;
+  }
+  #titleImg {
+    max-width: 95%;
+    max-height: 95%;
+    width: auto;
+    height: auto;
+  }
+  canvas { display: block; position: fixed; top: 0; left: 0; }
+</style>
+</head>
+<body>
+
+<div id="startScreen">
+  <img id="titleImg" src="">
+</div>
+
+<canvas id="demoCanvas"></canvas>
+
+<script>
+
+const ASSET_BASE = './assets/';
+
+const CHARACTERS = {
+  al: {
+    idleFrames: ['al/idle/b01.jpg', 'al/idle/b02.jpg'],
+    talkFrames: ['al/talk/b01.jpg', 'al/talk/b02.jpg', 'al/talk/b03.jpg'],
+    sounds: Array.from({length: 47}, (_, i) => `al/mp3s/Marko${i + 1}.mp3`),
+  },
+  em: {
+    idleFrames: ['em/idle/b01.jpg', 'em/idle/b02.jpg'],
+    talkFrames: ['em/talk/b01.jpg', 'em/talk/b02.jpg', 'em/talk/b03.jpg'],
+    sounds: Array.from({length: 43}, (_, i) => `em/mp3s/Tomas${i + 1}.mp3`),
+  },
+};
+
+const OUTRO_IMAGE = 'outro/endcredits1.jpg';
+const TITLE_FRAMES = ['title1.jpg', 'title2.jpg'];
+
+const GEN = {
+  duration: 20,
+  pauseMin: 1.0,
+  pauseMax: 2.0,
+  samplesPerTurn: [1, 4],
+  turnPauseMin: 0.5,
+  turnPauseMax: 1.5,
+  idleAnimSpeed: 600,
+  speakAnimSpeed: 300,
+  outroDuration: 5,
+  pauseAfterAudio: 5,
+};
+
+const canvas = document.getElementById('demoCanvas');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+const images = {};
+const audioDurations = {};
+let queue = [];
+let queueIndex = 0;
+let startTime = 0;
+let running = false;
+let animId = null;
+let currentAudio = null;
+let currentSpeaker = null;
+let currentAudioStartTime = 0;
+let pendingTimeout = null;
+let titleInterval = null;
+let phase = 'show'; // show | pause | outro | done
+
+const playAudio = new Audio();
+let currentEvent = null;
+
+playAudio.addEventListener('playing', () => {
+  currentSpeaker = currentEvent && currentEvent.char;
+  currentAudioStartTime = (performance.now() - startTime) / 1000;
+});
+playAudio.addEventListener('ended', () => {
+  currentAudio = null;
+  currentSpeaker = null;
+  if (phase === 'show' && currentEvent) {
+    pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
+  }
+});
+playAudio.addEventListener('error', () => {
+  currentAudio = null;
+  currentSpeaker = null;
+  if (phase === 'show' && currentEvent) {
+    pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
+  }
+});
+
+const rand = (min, max) => min + Math.random() * (max - min);
+const randInt = (min, max) => Math.floor(rand(min, max + 1));
+
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function loadImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => { console.warn('Image not found: ' + src); resolve(null); };
+    img.src = ASSET_BASE + src;
+  });
+}
+
+async function loadAllImages() {
+  const allImages = [OUTRO_IMAGE, ...TITLE_FRAMES];
+  for (const char of Object.values(CHARACTERS)) {
+    allImages.push(...char.idleFrames, ...char.talkFrames);
+  }
+  await Promise.all(allImages.map(src =>
+    loadImage(src).then(img => { images[src] = img; })
+  ));
+}
+
+function preloadAudioDurations() {
+  const TIMEOUT = 2000;
+  for (const char of Object.values(CHARACTERS)) {
+    for (const sound of char.sounds) {
+      const audio = new Audio(ASSET_BASE + sound);
+      audio.preload = 'metadata';
+      const cleanup = () => clearTimeout(timer);
+      const timer = setTimeout(() => {
+        cleanup();
+        audio.removeAttribute('src');
+      }, TIMEOUT);
+      audio.addEventListener('loadedmetadata', () => {
+        if (audio.duration && audio.duration > 0 && isFinite(audio.duration)) {
+          audioDurations[sound] = audio.duration;
+        }
+        cleanup();
+      });
+      audio.addEventListener('error', cleanup);
+    }
+  }
+}
+
+function stopAllSounds() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+    currentAudio = null;
+  }
+  if (pendingTimeout) {
+    clearTimeout(pendingTimeout);
+    pendingTimeout = null;
+  }
+}
+
+// Get duration for a sound file (preloaded) or a safe fallback
+function getDuration(soundKey) {
+  return audioDurations[soundKey] || 2.5;
+}
+
+function generateQueue() {
+  queue = [];
+  let speaker = Math.random() > 0.5 ? 'al' : 'em';
+
+  const pools = {
+    al: [...CHARACTERS['al'].sounds],
+    em: [...CHARACTERS['em'].sounds],
+  };
+
+  function pickFromPool(char) {
+    if (pools[char].length === 0) {
+      pools[char] = [...CHARACTERS[char].sounds];
+    }
+    const idx = randInt(0, pools[char].length - 1);
+    return pools[char].splice(idx, 1)[0];
+  }
+
+  let budget = GEN.duration;
+  while (budget > 0) {
+    const numSamples = randInt(GEN.samplesPerTurn[0], GEN.samplesPerTurn[1]);
+
+    for (let i = 0; i < numSamples && budget > 0; i++) {
+      const soundKey = pickFromPool(speaker);
+      const duration = getDuration(soundKey);
+      const pause = i < numSamples - 1 ? rand(GEN.pauseMin, GEN.pauseMax) : rand(GEN.turnPauseMin, GEN.turnPauseMax);
+      queue.push({ char: speaker, soundKey, duration, pause });
+      budget -= (duration + pause);
+    }
+
+    speaker = speaker === 'al' ? 'em' : 'al';
+  }
+}
+
+function playNext() {
+  pendingTimeout = null;
+
+  if (queueIndex >= queue.length) {
+    phase = 'pause';
+    return;
+  }
+
+  currentEvent = queue[queueIndex++];
+  currentAudioStartTime = (performance.now() - startTime) / 1000;
+
+  playAudio.src = ASSET_BASE + currentEvent.soundKey;
+  playAudio.play().catch(() => {
+    currentAudio = null;
+    currentSpeaker = null;
+    if (phase === 'show') {
+      pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
+    }
+  });
+  currentAudio = playAudio;
+}
+
+function render() {
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, W, H);
+
+  const gap = Math.max(20, Math.round(W * 0.04));
+  const marginX = Math.round(W * 0.05);
+  const marginY = Math.round(H * 0.08);
+  const baseY = H - marginY;
+
+  const emRef = images['em/idle/b01.jpg'];
+  const alRef = images['al/idle/b01.jpg'];
+  const emW = emRef?.width ?? 0;
+  const emH = emRef?.height ?? 0;
+  const alW = alRef?.width ?? 0;
+  const alH = alRef?.height ?? 0;
+
+  let scale = 1;
+  if (emW + alW > 0) {
+    const maxScaleW = (W - gap - 2 * marginX) / (emW + alW);
+    const maxScaleH = (H - 2 * marginY) / Math.max(emH, alH, 1);
+    scale = Math.min(1, maxScaleW, maxScaleH);
+  }
+  const baseX = (W - ((emW + alW) * scale + gap)) / 2;
+
+  const now = (performance.now() - startTime) / 1000;
+  const isSpeaking = currentAudio !== null;
+
+  for (const key of ['em', 'al']) {
+    const charDef = CHARACTERS[key];
+    const speaking = isSpeaking && currentSpeaker === key;
+    const t = speaking ? now - currentAudioStartTime : now;
+    const phase = Math.floor(t / (speaking ? GEN.speakAnimSpeed : GEN.idleAnimSpeed) * 1000);
+    const frames = speaking ? charDef.talkFrames : charDef.idleFrames;
+    const frameSrc = frames[phase % frames.length];
+
+    const img = images[frameSrc];
+    if (!img) continue;
+
+    const w = img.width * scale;
+    const h = img.height * scale;
+    const drawX = key === 'em' ? baseX : baseX + emW * scale + gap;
+    ctx.drawImage(img, drawX, baseY - h, w, h);
+  }
+}
+
+function showStartScreen() {
+  document.getElementById('startScreen').style.display = 'flex';
+  document.body.style.cursor = 'default';
+  let frame = 0;
+  const img = document.getElementById('titleImg');
+  img.src = ASSET_BASE + TITLE_FRAMES[0];
+  titleInterval = setInterval(() => {
+    frame = (frame + 1) % TITLE_FRAMES.length;
+    img.src = ASSET_BASE + TITLE_FRAMES[frame];
+  }, GEN.idleAnimSpeed);
+}
+
+function loop() {
+  if (phase === 'done') return;
+
+  const elapsed = (performance.now() - startTime) / 1000;
+
+  if (phase === 'show') {
+    render();
+    if (elapsed >= GEN.duration && !currentAudio && !pendingTimeout) {
+      phase = 'pause';
+    }
+  }
+
+  if (phase === 'pause') {
+    render();
+    const pauseElapsed = elapsed - GEN.duration;
+    if (pauseElapsed >= GEN.pauseAfterAudio) {
+      phase = 'outro';
+    }
+  }
+
+  if (phase === 'outro') {
+    const outroElapsed = elapsed - GEN.duration - GEN.pauseAfterAudio;
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, W, H);
+    const img = images[OUTRO_IMAGE];
+    if (img) {
+      const marginX = Math.round(W * 0.05);
+      const marginY = Math.round(H * 0.08);
+      const scale = Math.min(1, (W - 2 * marginX) / img.width, (H - 2 * marginY) / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+    }
+
+    if (outroElapsed >= GEN.outroDuration) {
+      phase = 'done';
+      stopAllSounds();
+      showStartScreen();
+      return;
+    }
+  }
+
+  animId = requestAnimationFrame(loop);
+}
+
+function startDemo() {
+  if (animId) cancelAnimationFrame(animId);
+  stopAllSounds();
+  if (titleInterval) { clearInterval(titleInterval); titleInterval = null; }
+
+  document.getElementById('startScreen').style.display = 'none';
+  document.body.style.cursor = 'none';
+
+  queueIndex = 0;
+  phase = 'show';
+  preloadAudioDurations();
+  generateQueue();
+
+  startTime = performance.now();
+  running = true;
+  pendingTimeout = setTimeout(playNext, 500);
+  animId = requestAnimationFrame(loop);
+}
+
+function stopDemo() {
+  phase = 'done';
+  running = false;
+  if (animId) cancelAnimationFrame(animId);
+  stopAllSounds();
+  if (titleInterval) { clearInterval(titleInterval); titleInterval = null; }
+  showStartScreen();
+}
+
+async function init() {
+  await loadAllImages();
+  preloadAudioDurations();
+  showStartScreen();
+  document.getElementById('startScreen').addEventListener('click', () => startDemo());
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') stopDemo();
+    if ((e.key === ' ' || e.key === 'Enter') && !running) startDemo();
+    if (e.key === 'f' || e.key === 'F') {
+      document.fullscreenElement
+        ? document.exitFullscreen()
+        : document.documentElement.requestFullscreen().catch(() => {});
+    }
+  });
+}
+
+init();
+</script>
+</body>
+</html>
