@@ -75,7 +75,6 @@ const images = {};
 const audioDurations = {};
 let queue = [];
 let queueIndex = 0;
-let startTime = 0;
 let running = false;
 let animId = null;
 let currentAudio = null;
@@ -85,12 +84,28 @@ let pendingTimeout = null;
 let titleInterval = null;
 let phase = 'show'; // show | pause | outro | done
 
+// Demo clock. Accumulated per rendered frame rather than read from
+// performance.now(), so it stops when rAF stops (hidden tab, stalled machine)
+// instead of racing ahead of what has actually been drawn. Long gaps are
+// clamped, so a background period can never skip a phase.
+const MAX_FRAME_DELTA = 0.1;
+let demoTime = 0;
+let lastFrameMs = 0;
+// When the current phase began, in demoTime. Phase durations are measured
+// against this, never against a fixed offset from the start of the demo.
+let phaseStart = 0;
+
+function setPhase(p) {
+  phase = p;
+  phaseStart = demoTime;
+}
+
 const playAudio = new Audio();
 let currentEvent = null;
 
 playAudio.addEventListener('playing', () => {
   currentSpeaker = currentEvent && currentEvent.char;
-  currentAudioStartTime = (performance.now() - startTime) / 1000;
+  currentAudioStartTime = demoTime;
 });
 playAudio.addEventListener('ended', () => {
   currentAudio = null;
@@ -214,12 +229,12 @@ function playNext() {
   pendingTimeout = null;
 
   if (queueIndex >= queue.length) {
-    phase = 'pause';
+    setPhase('pause');
     return;
   }
 
   currentEvent = queue[queueIndex++];
-  currentAudioStartTime = (performance.now() - startTime) / 1000;
+  currentAudioStartTime = demoTime;
 
   playAudio.src = ASSET_BASE + currentEvent.soundKey;
   playAudio.play().catch(() => {
@@ -256,7 +271,7 @@ function render() {
   }
   const baseX = (W - ((emW + alW) * scale + gap)) / 2;
 
-  const now = (performance.now() - startTime) / 1000;
+  const now = demoTime;
   const isSpeaking = currentAudio !== null;
 
   for (const key of ['em', 'al']) {
@@ -289,41 +304,42 @@ function showStartScreen() {
   }, GEN.idleAnimSpeed);
 }
 
+function renderOutro() {
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  const img = images[OUTRO_IMAGE];
+  if (img) {
+    const marginX = Math.round(W * 0.05);
+    const marginY = Math.round(H * 0.08);
+    const scale = Math.min(1, (W - 2 * marginX) / img.width, (H - 2 * marginY) / img.height);
+    const w = img.width * scale;
+    const h = img.height * scale;
+    ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+  }
+}
+
 function loop() {
   if (phase === 'done') return;
 
-  const elapsed = (performance.now() - startTime) / 1000;
+  const nowMs = performance.now();
+  demoTime += Math.min((nowMs - lastFrameMs) / 1000, MAX_FRAME_DELTA);
+  lastFrameMs = nowMs;
 
+  // One transition per frame: each phase gets at least one drawn frame, and
+  // its length is measured from when it actually began.
   if (phase === 'show') {
     render();
-    if (elapsed >= GEN.duration && !currentAudio && !pendingTimeout) {
-      phase = 'pause';
+    if (demoTime >= GEN.duration && !currentAudio && !pendingTimeout) {
+      setPhase('pause');
     }
-  }
-
-  if (phase === 'pause') {
+  } else if (phase === 'pause') {
     render();
-    const pauseElapsed = elapsed - GEN.duration;
-    if (pauseElapsed >= GEN.pauseAfterAudio) {
-      phase = 'outro';
+    if (demoTime - phaseStart >= GEN.pauseAfterAudio) {
+      setPhase('outro');
     }
-  }
-
-  if (phase === 'outro') {
-    const outroElapsed = elapsed - GEN.duration - GEN.pauseAfterAudio;
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, W, H);
-    const img = images[OUTRO_IMAGE];
-    if (img) {
-      const marginX = Math.round(W * 0.05);
-      const marginY = Math.round(H * 0.08);
-      const scale = Math.min(1, (W - 2 * marginX) / img.width, (H - 2 * marginY) / img.height);
-      const w = img.width * scale;
-      const h = img.height * scale;
-      ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
-    }
-
-    if (outroElapsed >= GEN.outroDuration) {
+  } else if (phase === 'outro') {
+    renderOutro();
+    if (demoTime - phaseStart >= GEN.outroDuration) {
       phase = 'done';
       stopAllSounds();
       showStartScreen();
@@ -343,11 +359,12 @@ function startDemo() {
   document.body.style.cursor = 'none';
 
   queueIndex = 0;
-  phase = 'show';
   preloadAudioDurations();
   generateQueue();
 
-  startTime = performance.now();
+  demoTime = 0;
+  lastFrameMs = performance.now();
+  setPhase('show');
   running = true;
   pendingTimeout = setTimeout(playNext, 500);
   animId = requestAnimationFrame(loop);
