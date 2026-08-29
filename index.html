@@ -55,16 +55,31 @@ const OUTRO_IMAGE = 'outro/endcredits1.jpg';
 const TITLE_FRAMES = ['title1.jpg', 'title2.jpg'];
 
 const GEN = {
-  duration: 20,
-  pauseMin: 1.0,
-  pauseMax: 2.0,
-  samplesPerTurn: [1, 4],
-  turnPauseMin: 0.5,
-  turnPauseMax: 1.5,
   idleAnimSpeed: 600,
   speakAnimSpeed: 300,
-  outroDuration: 5,
-  pauseAfterAudio: 5,
+};
+
+// Conversation constants from the 2004 release. JM_* names are the originals.
+// Sources: bulbengine/src/JmEnvironment.cpp:50-54 and resource/jm/timeline_jm.xml.
+const JM = {
+  // The idle gap between lines is bimodal: mostly a beat, occasionally a long
+  // awkward silence. That distribution is the demo's comic timing.
+  shortWaitProbability: 0.7, // JM_SHORT_WAIT_PROBABILITY
+  shortIdle: [0.2, 1.0],     // JM_MIN/MAX_SHORT_IDLE_TIME
+  longIdle: [3.0, 7.0],      // JM_MIN/MAX_LONG_IDLE_TIME
+  // JmEnvironment::render() - "implement pause at the beginning"
+  initialIdle: 3.0,
+  // timeline_jm.xml: jmgen activates at 110.5 with setEndTime 168.0, and
+  // jmoutro takes over at 170.0. So the conversation window is 57.5s, followed
+  // by 2.0s in which the characters only idle.
+  conversation: 57.5,
+  idleTail: 2.0,
+  // timeline_jm.xml: jmoutro 170.0 -> exit 175.0
+  outroDuration: 5.0,
+  // Mean of all 90 clips, used only when a clip's real duration is unknown.
+  meanClipLength: 3.17,
+  // Grace period on the talk watchdog (see talkDeadline).
+  talkGrace: 1.0,
 };
 
 const canvas = document.getElementById('demoCanvas');
@@ -73,39 +88,72 @@ let W, H;
 
 const images = {};
 const audioDurations = {};
-let queue = [];
-let queueIndex = 0;
-let startTime = 0;
 let running = false;
 let animId = null;
 let currentAudio = null;
 let currentSpeaker = null;
 let currentAudioStartTime = 0;
-let pendingTimeout = null;
 let titleInterval = null;
-let phase = 'show'; // show | pause | outro | done
+let phase = 'show'; // show | outro | done
+
+// Conversation state machine, mirroring JmEnvironment's JM_STATE_IDLE /
+// JM_STATE_TALK. One line is decided at a time; nothing is planned ahead.
+let convState = 'idle';   // idle | talk
+let nextStateTime = 0;    // when the current idle ends, in demoTime
+// Watchdog for the talk state. The original was purely timeout-driven
+// (nextStateTime = time + SampleBank::getLength()), so it could not hang. We
+// prefer the real 'ended' event for accuracy, but a media element that is
+// suspended -- a hidden tab, most commonly -- fires neither 'ended' nor
+// 'error', which would strand the state machine in 'talk' indefinitely.
+let talkDeadline = 0;
+let currentClipKey = null;
+
+// Demo clock. Accumulated per rendered frame rather than read from
+// performance.now(), so it stops when rAF stops (hidden tab, stalled machine)
+// instead of racing ahead of what has actually been drawn. Long gaps are
+// clamped, so a background period can never skip a phase.
+const MAX_FRAME_DELTA = 0.1;
+let demoTime = 0;
+let lastFrameMs = 0;
+// When the current phase began, in demoTime. Phase durations are measured
+// against this, never against a fixed offset from the start of the demo.
+let phaseStart = 0;
+
+function setPhase(p) {
+  phase = p;
+  phaseStart = demoTime;
+}
 
 const playAudio = new Audio();
-let currentEvent = null;
 
+// Re-sync the talk animation to the moment audio actually starts, so a slow
+// load does not leave the mouth flapping out of step with the voice.
 playAudio.addEventListener('playing', () => {
-  currentSpeaker = currentEvent && currentEvent.char;
-  currentAudioStartTime = (performance.now() - startTime) / 1000;
+  currentAudioStartTime = demoTime;
 });
-playAudio.addEventListener('ended', () => {
-  currentAudio = null;
-  currentSpeaker = null;
-  if (phase === 'show' && currentEvent) {
-    pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
+// The element's own metadata is authoritative, so use it to sharpen the
+// watchdog and to warm audioDurations for the endTime guard.
+playAudio.addEventListener('loadedmetadata', () => {
+  if (!isFinite(playAudio.duration) || playAudio.duration <= 0) return;
+  if (currentClipKey) audioDurations[currentClipKey] = playAudio.duration;
+  if (convState === 'talk') {
+    talkDeadline = demoTime + playAudio.duration - playAudio.currentTime + JM.talkGrace;
   }
 });
-playAudio.addEventListener('error', () => {
+// The original ended a talk state at time + SampleBank::getLength(). Driving it
+// off the real 'ended' event is the same edge, without trusting metadata.
+playAudio.addEventListener('ended', onLineFinished);
+playAudio.addEventListener('error', onLineFinished);
+
+function onLineFinished() {
+  if (convState !== 'talk') return;
   currentAudio = null;
-  currentSpeaker = null;
-  if (phase === 'show' && currentEvent) {
-    pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
-  }
-});
+  currentClipKey = null;
+  // No-op on the normal 'ended' path; stops a stalled clip on the watchdog
+  // path, so it cannot resume later on top of the next line.
+  if (!playAudio.paused) playAudio.pause();
+  startIdleSequence(demoTime);
+}
 
 const rand = (min, max) => min + Math.random() * (max - min);
 const randInt = (min, max) => Math.floor(rand(min, max + 1));
@@ -166,70 +214,46 @@ function stopAllSounds() {
     currentAudio.currentTime = 0;
     currentAudio = null;
   }
-  if (pendingTimeout) {
-    clearTimeout(pendingTimeout);
-    pendingTimeout = null;
-  }
 }
 
-// Get duration for a sound file (preloaded) or a safe fallback
+// Get duration for a sound file (preloaded) or a safe fallback. Only used to
+// decide whether a line still fits inside the conversation window.
 function getDuration(soundKey) {
-  return audioDurations[soundKey] || 2.5;
+  return audioDurations[soundKey] || JM.meanClipLength;
 }
 
-function generateQueue() {
-  queue = [];
-  let speaker = Math.random() > 0.5 ? 'al' : 'em';
-
-  const pools = {
-    al: [...CHARACTERS['al'].sounds],
-    em: [...CHARACTERS['em'].sounds],
-  };
-
-  function pickFromPool(char) {
-    if (pools[char].length === 0) {
-      pools[char] = [...CHARACTERS[char].sounds];
-    }
-    const idx = randInt(0, pools[char].length - 1);
-    return pools[char].splice(idx, 1)[0];
-  }
-
-  let budget = GEN.duration;
-  while (budget > 0) {
-    const numSamples = randInt(GEN.samplesPerTurn[0], GEN.samplesPerTurn[1]);
-
-    for (let i = 0; i < numSamples && budget > 0; i++) {
-      const soundKey = pickFromPool(speaker);
-      const duration = getDuration(soundKey);
-      const pause = i < numSamples - 1 ? rand(GEN.pauseMin, GEN.pauseMax) : rand(GEN.turnPauseMin, GEN.turnPauseMax);
-      queue.push({ char: speaker, soundKey, duration, pause });
-      budget -= (duration + pause);
-    }
-
-    speaker = speaker === 'al' ? 'em' : 'al';
-  }
+// JmEnvironment::startIdleSequence - both characters just stare at each other.
+function startIdleSequence(now) {
+  convState = 'idle';
+  currentSpeaker = null;
+  const [lo, hi] = Math.random() < JM.shortWaitProbability ? JM.shortIdle : JM.longIdle;
+  nextStateTime = now + rand(lo, hi);
 }
 
-function playNext() {
-  pendingTimeout = null;
+// JmEnvironment::startTalkSequence - one character says one line.
+function startTalkSequence(now) {
+  // rand() % 2, drawn fresh each line: the same character often speaks twice
+  // or more in a row. This is not turn-taking.
+  const speaker = Math.random() < 0.5 ? 'em' : 'al';
+  const sounds = CHARACTERS[speaker].sounds;
+  // rand() % size, uniform over the whole bank, repeats allowed.
+  const soundKey = sounds[randInt(0, sounds.length - 1)];
 
-  if (queueIndex >= queue.length) {
-    phase = 'pause';
+  // The endTime guard: start a line only if it finishes inside the window,
+  // otherwise idle again. A line is never cut off mid-word.
+  if (now + getDuration(soundKey) > JM.conversation) {
+    startIdleSequence(now);
     return;
   }
 
-  currentEvent = queue[queueIndex++];
-  currentAudioStartTime = (performance.now() - startTime) / 1000;
-
-  playAudio.src = ASSET_BASE + currentEvent.soundKey;
-  playAudio.play().catch(() => {
-    currentAudio = null;
-    currentSpeaker = null;
-    if (phase === 'show') {
-      pendingTimeout = setTimeout(playNext, currentEvent.pause * 1000);
-    }
-  });
+  convState = 'talk';
+  currentSpeaker = speaker;
+  currentAudioStartTime = now;
   currentAudio = playAudio;
+  currentClipKey = soundKey;
+  talkDeadline = now + getDuration(soundKey) + JM.talkGrace;
+  playAudio.src = ASSET_BASE + soundKey;
+  playAudio.play().catch(onLineFinished);
 }
 
 function render() {
@@ -256,12 +280,13 @@ function render() {
   }
   const baseX = (W - ((emW + alW) * scale + gap)) / 2;
 
-  const now = (performance.now() - startTime) / 1000;
-  const isSpeaking = currentAudio !== null;
+  const now = demoTime;
 
   for (const key of ['em', 'al']) {
     const charDef = CHARACTERS[key];
-    const speaking = isSpeaking && currentSpeaker === key;
+    // currentSpeaker is the equivalent of the original's emAnimation /
+    // alAnimation pair: exactly one character talks, the other idles.
+    const speaking = currentSpeaker === key;
     const t = speaking ? now - currentAudioStartTime : now;
     const phase = Math.floor(t / (speaking ? GEN.speakAnimSpeed : GEN.idleAnimSpeed) * 1000);
     const frames = speaking ? charDef.talkFrames : charDef.idleFrames;
@@ -289,41 +314,47 @@ function showStartScreen() {
   }, GEN.idleAnimSpeed);
 }
 
+function renderOutro() {
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  const img = images[OUTRO_IMAGE];
+  if (img) {
+    const marginX = Math.round(W * 0.05);
+    const marginY = Math.round(H * 0.08);
+    const scale = Math.min(1, (W - 2 * marginX) / img.width, (H - 2 * marginY) / img.height);
+    const w = img.width * scale;
+    const h = img.height * scale;
+    ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+  }
+}
+
 function loop() {
   if (phase === 'done') return;
 
-  const elapsed = (performance.now() - startTime) / 1000;
+  const nowMs = performance.now();
+  demoTime += Math.min((nowMs - lastFrameMs) / 1000, MAX_FRAME_DELTA);
+  lastFrameMs = nowMs;
 
+  // One transition per frame: each phase gets at least one drawn frame, and
+  // its length is measured from when it actually began.
   if (phase === 'show') {
+    // JmEnvironment::render() polls the state machine once per frame. The
+    // talk -> idle edge is driven by the audio's 'ended' event instead.
+    if (convState === 'idle' && demoTime > nextStateTime) {
+      startTalkSequence(demoTime);
+    } else if (convState === 'talk' && demoTime > talkDeadline) {
+      onLineFinished();
+    }
     render();
-    if (elapsed >= GEN.duration && !currentAudio && !pendingTimeout) {
-      phase = 'pause';
+    // The scene switch is at a fixed time, as in the timeline. After
+    // JM.conversation no new line starts, so this tail is idling only.
+    if (demoTime >= JM.conversation + JM.idleTail) {
+      stopAllSounds();
+      setPhase('outro');
     }
-  }
-
-  if (phase === 'pause') {
-    render();
-    const pauseElapsed = elapsed - GEN.duration;
-    if (pauseElapsed >= GEN.pauseAfterAudio) {
-      phase = 'outro';
-    }
-  }
-
-  if (phase === 'outro') {
-    const outroElapsed = elapsed - GEN.duration - GEN.pauseAfterAudio;
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, W, H);
-    const img = images[OUTRO_IMAGE];
-    if (img) {
-      const marginX = Math.round(W * 0.05);
-      const marginY = Math.round(H * 0.08);
-      const scale = Math.min(1, (W - 2 * marginX) / img.width, (H - 2 * marginY) / img.height);
-      const w = img.width * scale;
-      const h = img.height * scale;
-      ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
-    }
-
-    if (outroElapsed >= GEN.outroDuration) {
+  } else if (phase === 'outro') {
+    renderOutro();
+    if (demoTime - phaseStart >= JM.outroDuration) {
       phase = 'done';
       stopAllSounds();
       showStartScreen();
@@ -342,19 +373,28 @@ function startDemo() {
   document.getElementById('startScreen').style.display = 'none';
   document.body.style.cursor = 'none';
 
-  queueIndex = 0;
-  phase = 'show';
   preloadAudioDurations();
-  generateQueue();
 
-  startTime = performance.now();
+  demoTime = 0;
+  lastFrameMs = performance.now();
+  setPhase('show');
   running = true;
-  pendingTimeout = setTimeout(playNext, 500);
+
+  // JmEnvironment::render(): "implement pause at the beginning". Both
+  // characters idle for 3s before anyone says anything.
+  convState = 'idle';
+  currentSpeaker = null;
+  currentClipKey = null;
+  nextStateTime = JM.initialIdle;
+
   animId = requestAnimationFrame(loop);
 }
 
 function stopDemo() {
   phase = 'done';
+  convState = 'idle';
+  currentSpeaker = null;
+  currentClipKey = null;
   running = false;
   if (animId) cancelAnimationFrame(animId);
   stopAllSounds();
